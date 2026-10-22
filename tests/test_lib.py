@@ -212,3 +212,81 @@ async def test_account_choices_falls_back_to_numbers_on_error(monkeypatch):
     choices = await _api().account_choices()
     assert [c["number"] for c in choices] == ["A-1", "A-2"]
     assert [c["label"] for c in choices] == ["A-1", "A-2"]
+
+
+
+def _expired_jwt_response():
+    """Kraken sometimes classifies JWT expiry as an APPLICATION error."""
+    return {
+        "data": {"account": None},
+        "errors": [{
+            "message": "Signature of the JWT has expired.",
+            "extensions": {"errorType": "APPLICATION", "errorCode": "KT-CT-1124"},
+        }],
+    }
+
+
+async def test_account_refreshes_expired_jwt_and_retries_once(monkeypatch):
+    """An expired billing query recovers with a new token and one retry."""
+    billing = {"data": {"account": {"billingOptions": {}, "ledgers": [
+        {"ledgerType": mod.ELECTRICITY_LEDGER, "balance": 0,
+         "invoices": {"edges": []}}
+    ]}}}
+    calls = []
+    responses = [_expired_jwt_response(), billing]
+    async def execute(query, variables=None):
+        return responses.pop(0)
+    class Client:
+        def __init__(self, *args, **kwargs):
+            calls.append(kwargs.get("headers", {}).get("authorization"))
+        execute_async = staticmethod(execute)
+    async def login(self):
+        self._token = "refreshed-token"
+        return True
+    monkeypatch.setattr(mod, "GraphqlClient", Client)
+    monkeypatch.setattr(mod.OctopusSpain, "login", login)
+    api = _api()
+    async def forecast(account):
+        return None
+    monkeypatch.setattr(api, "payment_forecast", forecast)
+    result = await api.account("A-1")
+    assert result["billing"] is None
+    assert result["last_invoice"]["id"] is None
+    assert calls == ["t", "refreshed-token"]
+
+
+async def test_expired_jwt_retry_is_bounded(monkeypatch):
+    """Persistent auth failure must not loop or retry indefinitely."""
+    client = _SeqClient([_expired_jwt_response(), _expired_jwt_response()])
+    _patch(monkeypatch, client)
+    calls = []
+    async def login(self):
+        calls.append(True)
+        self._token = "refreshed-token"
+        return True
+    monkeypatch.setattr(mod.OctopusSpain, "login", login)
+    payload = await _api().account("A-1")
+    assert payload["last_invoice"]["id"] is None
+    assert len(client.calls) == 2
+    assert len(calls) == 1
+
+
+async def test_expired_jwt_failed_refresh_does_not_retry(monkeypatch):
+    """If re-authentication fails, preserve normal fallback without a second query."""
+    client = _SeqClient([_expired_jwt_response()])
+    _patch(monkeypatch, client)
+    async def login(self):
+        return False
+    monkeypatch.setattr(mod.OctopusSpain, "login", login)
+    payload = await _api().account("A-1")
+    assert payload["last_invoice"]["id"] is None
+    assert len(client.calls) == 1
+
+
+async def test_expired_jwt_recognizes_error_code_without_matching_message():
+    assert mod._is_expired_token_error({
+        "errors": [{"message": "Access rejected", "extensions": {"errorCode": "KT-CT-1124"}}]
+    })
+    assert not mod._is_expired_token_error({
+        "errors": [{"message": "Payment not available", "extensions": {"errorCode": "KT-CT-3949"}}]
+    })
