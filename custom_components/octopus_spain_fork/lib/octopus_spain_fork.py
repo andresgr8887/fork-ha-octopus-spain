@@ -32,6 +32,21 @@ def _error_message(response: Any) -> str:
     return "Octopus API returned no data"
 
 
+def _is_expired_token_error(response: Any) -> bool:
+    """Detect Kraken's expired JWT error, including APPLICATION-classified errors."""
+    if not isinstance(response, dict):
+        return False
+    for error in response.get("errors") or []:
+        if not isinstance(error, dict):
+            continue
+        extensions = error.get("extensions") or {}
+        if isinstance(extensions, dict) and extensions.get("errorCode") == "KT-CT-1124":
+            return True
+        if "signature of the jwt has expired" in str(error.get("message", "")).lower():
+            return True
+    return False
+
+
 def _empty_account_payload(
     solar_wallet: Optional[float] = None,
     octopus_credit: Optional[float] = None,
@@ -151,6 +166,33 @@ class OctopusSpain:
         self._token = response["data"]["obtainKrakenToken"]["token"]
         return True
 
+    async def _execute_authenticated(self, query: str, variables: Optional[dict] = None):
+        """Retry read-only GraphQL queries once on JWT expiry."""
+        original_token = self._token
+
+        async def execute(token):
+            client = GraphqlClient(
+                endpoint=GRAPH_QL_ENDPOINT,
+                headers={"authorization": token},
+            )
+            if variables is None:
+                return await client.execute_async(query)
+            return await client.execute_async(query, variables)
+
+        response = await execute(original_token)
+        if not _is_expired_token_error(response):
+            return response
+
+        _LOGGER.info("Octopus JWT expired; refreshing authentication and retrying once")
+        # Another concurrent request may have renewed the token already.
+        if self._token == original_token:
+            self._token = None
+            if not await self.login():
+                return response
+        if not self._token:
+            return response
+        return await execute(self._token)
+
     async def regenerate_api_key(self) -> str | None:
         """Generate a new API key for the authenticated user.
 
@@ -193,9 +235,7 @@ class OctopusSpain:
             }
             """
 
-        headers = {"authorization": self._token}
-        client = GraphqlClient(endpoint=GRAPH_QL_ENDPOINT, headers=headers)
-        response = await client.execute_async(query)
+        response = await self._execute_authenticated(query)
 
         return list(map(lambda a: a["number"], response["data"]["viewer"]["accounts"]))
 
@@ -237,9 +277,7 @@ class OctopusSpain:
         """
 
         try:
-            headers = {"authorization": self._token}
-            client = GraphqlClient(endpoint=GRAPH_QL_ENDPOINT, headers=headers)
-            response = await client.execute_async(query)
+            response = await self._execute_authenticated(query)
             accounts = (
                 ((response or {}).get("data") or {}).get("viewer") or {}
             ).get("accounts")
@@ -463,12 +501,9 @@ class OctopusSpain:
                 }
             ],
         }
-        headers = {"authorization": self._token}
-        client = GraphqlClient(endpoint=GRAPH_QL_ENDPOINT, headers=headers)
-
         results: list[dict] = []
         while True:
-            response = await client.execute_async(query, variables)
+            response = await self._execute_authenticated(query, variables)
             if not isinstance(response, dict):
                 raise OctopusApiError(
                     f"No response fetching {reading_frequency_type.lower()} "
@@ -609,9 +644,7 @@ class OctopusSpain:
               }
             }
         """
-        headers = {"authorization": self._token}
-        client = GraphqlClient(endpoint=GRAPH_QL_ENDPOINT, headers=headers)
-        response = await client.execute_async(query, {"account": account})
+        response = await self._execute_authenticated(query, {"account": account})
         if not isinstance(response, dict):
             _LOGGER.error(
                 "Failed to fetch billing info for account %s: no response from API",
@@ -770,9 +803,7 @@ class OctopusSpain:
               }
             }
         """
-        headers = {"authorization": self._token}
-        client = GraphqlClient(endpoint=GRAPH_QL_ENDPOINT, headers=headers)
-        response = await client.execute_async(query, {"account": account})
+        response = await self._execute_authenticated(query, {"account": account})
         if not isinstance(response, dict):
             _LOGGER.warning(
                 "Failed to fetch payment forecast for account %s: no response from API",
@@ -865,9 +896,7 @@ class OctopusSpain:
               }
             }
         """
-        headers = {"authorization": self._token}
-        client = GraphqlClient(endpoint=GRAPH_QL_ENDPOINT, headers=headers)
-        response = await client.execute_async(query, {"account": account})
+        response = await self._execute_authenticated(query, {"account": account})
         if not isinstance(response, dict):
             _LOGGER.warning(
                 "Failed to fetch supply points for account %s: no response from API",
